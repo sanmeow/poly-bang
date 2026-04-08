@@ -1,3 +1,4 @@
+```html
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -59,7 +60,7 @@
         const BASE_SIZE = 10;          
         const BASE_THICKNESS = 0.2;   
 
-        // --- 控制台參數 (取代原本的 HTML UI) ---
+        // --- 控制台參數 ---
         const params = {
             shape: 'box',
             scaleX: 1.0,
@@ -68,9 +69,10 @@
             pieces: 45,
             density: 1.5,
             regenerate: () => triggerRegenerate(),
-            viewStep: 3, // 1: Boundary, 2: Points, 3: Cells
+            viewStep: 3, 
             renderMode: 'Solid',
             explode: 0.0,
+            exportCleanMeshes: true, // 新增：是否匯出乾淨的獨立網格
             exportGLB: () => exportGLB()
         };
         
@@ -120,7 +122,6 @@
 
             const folderShape = gui.addFolder('1. Shape & Scale');
             folderShape.add(params, 'shape', { '立方體 (Box)': 'box', '薄玻璃 (Plane)': 'plane', '球體 (Sphere)': 'sphere', '圓柱 (Cylinder)': 'cylinder' }).name('Shape').onChange(v => {
-                // 智慧預設值
                 if (v === 'cylinder') { params.scaleX = 0.5; params.scaleY = 1.5; params.scaleZ = 0.5; camera.position.set(13, 16, 24); } 
                 else if (v === 'plane') { params.scaleX = 1; params.scaleY = 1; params.scaleZ = 1; camera.position.set(0, 0, 24); } 
                 else { params.scaleX = 1; params.scaleY = 1; params.scaleZ = 1; camera.position.set(13, 15, 22); }
@@ -143,10 +144,12 @@
             folderView.add(params, 'renderMode', ['Solid', 'Wireframe']).name('Render Mode').onChange(updateVisibility);
             folderView.add(params, 'explode', 0, 1).name('Explode 爆開');
 
+            // 將匯出功能獨立或是放在最底層
+            gui.add(params, 'exportCleanMeshes').name('✅ 僅匯出獨立實體 (Clean)');
             gui.add(params, 'exportGLB').name('💾 匯出 GLB 模型');
         }
 
-        // --- 核心演算法 (完全保留不變) ---
+        // --- 核心演算法 ---
         function getBiasedRandom(density) {
             const r = Math.pow(Math.random(), density);
             return Math.random() < 0.5 ? -r : r; 
@@ -345,7 +348,7 @@
 
             const cellGeometries = generateVoronoiCells(points, bounds);
 
-            cellGeometries.forEach(geom => {
+            cellGeometries.forEach((geom, index) => {
                 const group = new THREE.Group();
                 let rough = 0.55; let metal = 0.05;
                 if (params.shape === 'plane') { rough = 0.15; metal = 0.15; }
@@ -358,6 +361,7 @@
                     roughness: rough, metalness: metal,
                     polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
                 });
+                
                 const solidMesh = new THREE.Mesh(geom, solidMat);
                 solidMesh.name = "solid";
                 group.add(solidMesh);
@@ -398,20 +402,56 @@
             });
         }
 
+        // --- 優化版 GLB 匯出功能 (分離獨立 Mesh) ---
         function exportGLB() {
             if (Number(params.viewStep) !== 3) { alert("請切換至「碎片(3)」檢視模式再進行匯出！"); return; }
             
+            // 確保當下畫面運算完畢
             renderer.render(scene, camera);
             const exporter = new GLTFExporter();
+            
+            let exportTarget = cellGroup;
+
+            // 如果使用者勾選了「僅匯出獨立實體 (Clean)」
+            // 我們動態產生一個乾淨的群組，把每一塊實體 Mesh 直接拉出來，去除多餘的線框和子群組
+            if (params.exportCleanMeshes) {
+                exportTarget = new THREE.Group();
+                exportTarget.name = `Shattered_${params.shape}_Root`;
+                
+                // 繼承主體的縮放與位置
+                exportTarget.scale.copy(cellGroup.scale);
+                exportTarget.position.copy(cellGroup.position);
+                exportTarget.rotation.copy(cellGroup.rotation);
+
+                cellGroup.children.forEach((cell, index) => {
+                    const solid = cell.getObjectByName("solid");
+                    if (solid && solid.visible) { // 只匯出有顯示的實體
+                        const cleanMesh = solid.clone();
+                        cleanMesh.name = `Piece_${index + 1}`; // 獨立命名，方便在 Blender 辨識
+                        
+                        // 將碎片當下的爆炸位移繼承過來
+                        cleanMesh.position.copy(cell.position);
+                        cleanMesh.rotation.copy(cell.rotation);
+                        cleanMesh.scale.copy(cell.scale);
+                        
+                        exportTarget.add(cleanMesh);
+                    }
+                });
+            }
+
             exporter.parse(
-                cellGroup,
+                exportTarget,
                 function ( gltf ) {
                     const blob = new Blob( [ gltf ], { type: 'application/octet-stream' } );
                     const url = URL.createObjectURL( blob );
                     const link = document.createElement( 'a' );
                     link.style.display = 'none'; link.href = url;
+                    
                     const explodePercent = Math.round(params.explode * 100);
-                    link.download = `Shattered_${params.shape}_${params.pieces}pcs_${explodePercent}pct.glb`;
+                    // 檔名加上 clean 標記
+                    const suffix = params.exportCleanMeshes ? "_clean" : "";
+                    link.download = `Shattered_${params.shape}_${params.pieces}pcs_${explodePercent}pct${suffix}.glb`;
+                    
                     document.body.appendChild( link ); link.click(); document.body.removeChild( link );
                     URL.revokeObjectURL( url );
                 },
@@ -443,3 +483,4 @@
 </html>
 
 
+```
