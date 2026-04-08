@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D Shattered Physics & GUI</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #1e1e1e;
+            touch-action: none;
+        }
+        canvas { display: block; }
+
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(255,255,255,0.95); padding: 20px 40px; border-radius: 12px;
+            font-weight: bold; color: #333; box-shadow: 0 4px 20px rgba(0,0,0,0.15); z-index: 100;
+            display: flex; flex-direction: column; align-items: center; gap: 12px;
+        }
+        .spinner {
+            width: 28px; height: 28px; border: 3px solid #eee; border-top: 3px solid #2196F3;
+            border-radius: 50%; animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+                "cannon-es": "https://esm.sh/cannon-es@0.20.0"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="loading"><div class="spinner"></div><span id="load-text">生成幾何體...</span></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { ConvexGeometry } from 'three/addons/geometries/ConvexGeometry.js';
+        import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+        import * as CANNON from 'cannon-es';
+
+        let scene, camera, renderer, controls;
+
+        const boundaryGroup = new THREE.Group();
+        const pointsMesh = new THREE.Group();
+        const cellGroup = new THREE.Group();
+
+        let physicsWorld = null;
+        let floorBody = null;
+        let glassMaterial = null;   // 關鍵：保存參考，不再從 world 撈
+        let clock = new THREE.Clock();
+
+        const BASE_SIZE = 10;
+        const BASE_THICKNESS = 0.2;
+
+        // 物理碰撞殼相對視覺幾何的縮小比率（3% 間隙避開初始接觸抖動）
+        const COLLIDER_SHRINK = 0.97;
+
+        // --- 控制台參數 ---
+        const params = {
+            shape: 'box',
+            scaleX: 1.0,
+            scaleY: 1.0,
+            scaleZ: 1.0,
+            pieces: 45,
+            density: 1.5,
+            regenerate: () => { resetPhysics(); triggerRegenerate(); },
+
+            viewStep: 3,
+            renderMode: 'Solid',
+            explode: 0.0,
+
+            physicsExplodeForce: 0.0,
+            physicsPlay: false,
+            // ▶ 掉落：每次按都從初始定格重新播放動畫
+            startGravity: () => {
+                if (Number(params.viewStep) !== 3) {
+                    params.viewStep = 3;
+                    updateVisibility();
+                }
+                resetPhysics();           // 回到初始定格 + 清空舊 bodies
+                params.physicsPlay = true;
+                startPhysics();           // 重新建立 bodies 並開始播放
+                if (pauseCtrl) pauseCtrl.name('⏸ 暫停');
+                if (gui) gui.controllersRecursive().forEach(c => c.updateDisplay());
+            },
+            // ⏸ 暫停 / ▶ 繼續：切換暫停狀態（保留 bodies 當前位置與速度）
+            togglePause: () => {
+                let hasBodies = false;
+                cellGroup.children.forEach(c => { if (c.userData.physicsBody) hasBodies = true; });
+                if (!hasBodies) return;   // idle 狀態下不反應
+                params.physicsPlay = !params.physicsPlay;
+                if (pauseCtrl) pauseCtrl.name(params.physicsPlay ? '⏸ 暫停' : '▶ 繼續');
+            },
+            // ↺ 復位：回到初始定格，方便調整參數
+            physicsReset: () => {
+                resetPhysics();
+                if (pauseCtrl) pauseCtrl.name('⏸ 暫停');
+            },
+
+            exportCleanMeshes: true,
+            exportGLB: () => exportGLB()
+        };
+
+        let gui;
+        let pauseCtrl;   // ⏸ 暫停按鈕的 controller，用來動態改 label
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color('#242629');
+            scene.fog = new THREE.Fog('#242629', 20, 80);
+
+            camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(15, 18, 28);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.target.set(0, -6, 0);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+
+            const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight1.position.set(12, 25, 15);
+            dirLight1.castShadow = true;
+            dirLight1.shadow.mapSize.width = 1024;
+            dirLight1.shadow.mapSize.height = 1024;
+            dirLight1.shadow.camera.near = 0.5;
+            dirLight1.shadow.camera.far = 100;
+            dirLight1.shadow.camera.left = -25;
+            dirLight1.shadow.camera.right = 25;
+            dirLight1.shadow.camera.top = 25;
+            dirLight1.shadow.camera.bottom = -25;
+            scene.add(dirLight1);
+
+            const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.3);
+            dirLight2.position.set(-15, -10, -15);
+            scene.add(dirLight2);
+
+            const floorGeo = new THREE.PlaneGeometry(300, 300);
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.9, metalness: 0.1 });
+            const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+            floorMesh.rotation.x = -Math.PI / 2;
+            floorMesh.position.y = -15;
+            floorMesh.receiveShadow = true;
+            scene.add(floorMesh);
+
+            const gridHelper = new THREE.GridHelper(300, 100, 0x555555, 0x222222);
+            gridHelper.position.y = -14.95;
+            scene.add(gridHelper);
+
+            scene.add(boundaryGroup);
+            scene.add(pointsMesh);
+            scene.add(cellGroup);
+
+            setupGUI();
+            triggerRegenerate();
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function setupGUI() {
+            gui = new GUI({ title: 'Shattered & Physics', width: 300 });
+
+            const folderShape = gui.addFolder('1. Shape & Scale (形狀/尺寸)');
+            folderShape.add(params, 'shape', { '立方體 Box': 'box', '薄玻璃 Plane': 'plane', '球體 Sphere': 'sphere', '圓柱 Cylinder': 'cylinder' }).name('Shape').onChange(v => {
+                resetPhysics();
+                if (v === 'cylinder') { params.scaleX = 0.5; params.scaleY = 1.5; params.scaleZ = 0.5; }
+                else if (v === 'plane') { params.scaleX = 1; params.scaleY = 1; params.scaleZ = 1; }
+                else { params.scaleX = 1; params.scaleY = 1; params.scaleZ = 1; }
+                gui.controllersRecursive().forEach(c => c.updateDisplay());
+                triggerRegenerate();
+            });
+            folderShape.add(params, 'scaleX', 0.2, 3).name('Scale X').onFinishChange(triggerRegenerate);
+            folderShape.add(params, 'scaleY', 0.2, 3).name('Scale Y').onFinishChange(triggerRegenerate);
+            folderShape.add(params, 'scaleZ', 0.2, 3).name('Scale Z').onFinishChange(triggerRegenerate);
+
+            const folderFrac = gui.addFolder('2. Fracture (破裂)');
+            folderFrac.add(params, 'pieces', 5, 120, 1).name('碎裂數量').onFinishChange(triggerRegenerate);
+            folderFrac.add(params, 'density', 1, 4, 0.1).name('中心密集度').onFinishChange(triggerRegenerate);
+            folderFrac.add(params, 'regenerate').name('🔄 重新生成切割');
+
+            const folderView = gui.addFolder('3. View & Offset (視覺推移)');
+            folderView.add(params, 'viewStep', { '1. 邊界': 1, '2. 擊碎點': 2, '3. 碎片': 3 }).name('Step').onChange(updateVisibility);
+            folderView.add(params, 'renderMode', ['Solid', 'Wireframe']).name('Render Mode').onChange(updateVisibility);
+            folderView.add(params, 'explode', 0, 1).name('靜態展開距離').onChange(() => {
+                if (params.physicsPlay) resetPhysics();
+            });
+
+            const folderPhys = gui.addFolder('4. Physics (真實物理)');
+            folderPhys.add(params, 'physicsExplodeForce', 0, 50).name('物理爆炸強度');
+            folderPhys.add(params, 'startGravity').name('▶ 掉落 (再按重播)');
+            pauseCtrl = folderPhys.add(params, 'togglePause').name('⏸ 暫停');
+            folderPhys.add(params, 'physicsReset').name('↺ 復位 (回到定格)');
+
+            const folderExport = gui.addFolder('5. Export (匯出)');
+            folderExport.add(params, 'exportCleanMeshes').name('✅ 僅匯出獨立實體 (Clean)');
+            folderExport.add(params, 'exportGLB').name('💾 匯出 GLB 檔案');
+        }
+
+        // --- 物理引擎 ---
+        function initPhysicsWorld() {
+            if (physicsWorld) return;
+            physicsWorld = new CANNON.World({
+                gravity: new CANNON.Vec3(0, -35, 0)
+            });
+            physicsWorld.solver.iterations = 12;
+            physicsWorld.allowSleep = true;
+
+            glassMaterial = new CANNON.Material('glass');
+            const glassContactMaterial = new CANNON.ContactMaterial(
+                glassMaterial, glassMaterial, {
+                    friction: 0.35,
+                    restitution: 0.0   // 不彈
+                }
+            );
+            physicsWorld.addContactMaterial(glassContactMaterial);
+            physicsWorld.defaultContactMaterial.friction = 0.35;
+            physicsWorld.defaultContactMaterial.restitution = 0.0;
+
+            const floorShape = new CANNON.Plane();
+            floorBody = new CANNON.Body({
+                mass: 0,
+                material: glassMaterial
+            });
+            floorBody.addShape(floorShape);
+            floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+            floorBody.position.set(0, -15, 0);
+            physicsWorld.addBody(floorBody);
+        }
+
+        // 把 three.js ConvexGeometry 轉成 CANNON.ConvexPolyhedron
+        // 1) 用 tolerance 去重複點
+        // 2) 三角形 index 作為 face
+        function threeConvexToCannon(geometry, shrink = 1.0) {
+            const pos = geometry.attributes.position;
+            const verts = [];
+            const indexMap = new Array(pos.count);
+            const tol = 1e-4;
+
+            for (let i = 0; i < pos.count; i++) {
+                const x = pos.getX(i) * shrink;
+                const y = pos.getY(i) * shrink;
+                const z = pos.getZ(i) * shrink;
+                let found = -1;
+                for (let j = 0; j < verts.length; j++) {
+                    const v = verts[j];
+                    if (Math.abs(v.x - x) < tol && Math.abs(v.y - y) < tol && Math.abs(v.z - z) < tol) {
+                        found = j; break;
+                    }
+                }
+                if (found >= 0) {
+                    indexMap[i] = found;
+                } else {
+                    indexMap[i] = verts.length;
+                    verts.push(new CANNON.Vec3(x, y, z));
+                }
+            }
+
+            const faces = [];
+            for (let i = 0; i < pos.count; i += 3) {
+                const a = indexMap[i], b = indexMap[i+1], c = indexMap[i+2];
+                if (a === b || b === c || a === c) continue;
+                faces.push([a, b, c]);
+            }
+
+            if (verts.length < 4 || faces.length < 4) return null;
+            return new CANNON.ConvexPolyhedron({ vertices: verts, faces: faces });
+        }
+
+        function startPhysics() {
+            initPhysicsWorld();
+
+            cellGroup.children.forEach(cell => {
+                if (cell.userData.physicsBody) {
+                    physicsWorld.removeBody(cell.userData.physicsBody);
+                    cell.userData.physicsBody = null;
+                }
+            });
+
+            cellGroup.children.forEach(cell => {
+                const solid = cell.getObjectByName('solid');
+                if (!solid) return;
+
+                // 【關鍵修復 1】：用真實凸殼，不是 AABB
+                // 【關鍵修復 2】：碰撞幾何微縮 3% → 相鄰碎片之間有安全空氣層
+                const shape = threeConvexToCannon(solid.geometry, COLLIDER_SHRINK);
+                if (!shape) return;
+
+                // 用 bounding box 估算質量（夠用）
+                solid.geometry.computeBoundingBox();
+                const b = solid.geometry.boundingBox;
+                const vol = Math.max((b.max.x - b.min.x) * (b.max.y - b.min.y) * (b.max.z - b.min.z), 0.001);
+
+                const body = new CANNON.Body({
+                    mass: vol * 10,
+                    material: glassMaterial,   // 【關鍵修復 3】：真的套到我們定義的 glass
+                    position: new CANNON.Vec3(cell.position.x, cell.position.y, cell.position.z),
+                    allowSleep: true,
+                    sleepSpeedLimit: 0.1,
+                    sleepTimeLimit: 0.5
+                });
+                body.addShape(shape);
+
+                const force = params.physicsExplodeForce;
+                if (force > 0) {
+                    const centroid = cell.userData.centroid.clone();
+                    if (centroid.lengthSq() < 0.001) centroid.set(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5);
+
+                    centroid.normalize().multiplyScalar(force);
+                    const jitter = force * 0.15;
+                    body.velocity.set(
+                        centroid.x + (Math.random()-0.5) * jitter,
+                        centroid.y + (Math.random()-0.5) * jitter,
+                        centroid.z + (Math.random()-0.5) * jitter
+                    );
+                    const spin = force * 0.4;
+                    body.angularVelocity.set((Math.random()-0.5)*spin, (Math.random()-0.5)*spin, (Math.random()-0.5)*spin);
+                } else {
+                    body.velocity.set(0, 0, 0);
+                    body.angularVelocity.set(0, 0, 0);
+                }
+
+                physicsWorld.addBody(body);
+                cell.userData.physicsBody = body;
+            });
+        }
+
+        function resetPhysics() {
+            params.physicsPlay = false;
+            if (gui) gui.controllersRecursive().forEach(c => c.updateDisplay());
+
+            if (physicsWorld) {
+                cellGroup.children.forEach(cell => {
+                    if (cell.userData.physicsBody) {
+                        physicsWorld.removeBody(cell.userData.physicsBody);
+                        cell.userData.physicsBody = null;
+                    }
+                });
+            }
+
+            const maxExplodeDistance = 3.0;
+            cellGroup.children.forEach(cell => {
+                cell.position.copy(cell.userData.centroid).multiplyScalar(1 + params.explode * maxExplodeDistance);
+                cell.quaternion.identity();
+            });
+        }
+
+        function getBiasedRandom(density) {
+            const r = Math.pow(Math.random(), density);
+            return Math.random() < 0.5 ? -r : r;
+        }
+
+        function getShapeData() {
+            const points = [];
+            const bounds = [];
+            let boundaryGeom;
+
+            const hS = BASE_SIZE / 2;
+            const piecesCount = params.pieces;
+            const density = params.density;
+
+            if (params.shape === 'box') {
+                for(let i=0; i<piecesCount; i++) {
+                    points.push(new THREE.Vector3(
+                        getBiasedRandom(density) * hS * 0.95,
+                        getBiasedRandom(density) * hS * 0.95,
+                        getBiasedRandom(density) * hS * 0.95
+                    ));
+                }
+                bounds.push(
+                    new THREE.Plane(new THREE.Vector3(1, 0, 0), -hS), new THREE.Plane(new THREE.Vector3(-1, 0, 0), -hS),
+                    new THREE.Plane(new THREE.Vector3(0, 1, 0), -hS), new THREE.Plane(new THREE.Vector3(0, -1, 0), -hS),
+                    new THREE.Plane(new THREE.Vector3(0, 0, 1), -hS), new THREE.Plane(new THREE.Vector3(0, 0, -1), -hS)
+                );
+                boundaryGeom = new THREE.BoxGeometry(BASE_SIZE, BASE_SIZE, BASE_SIZE);
+
+            } else if (params.shape === 'plane') {
+                const hT = BASE_THICKNESS / 2;
+                for(let i=0; i<piecesCount; i++) {
+                    points.push(new THREE.Vector3(
+                        getBiasedRandom(density) * hS * 0.95,
+                        getBiasedRandom(density) * hS * 0.95,
+                        (Math.random() - 0.5) * BASE_THICKNESS * 0.8
+                    ));
+                }
+                bounds.push(
+                    new THREE.Plane(new THREE.Vector3(1, 0, 0), -hS), new THREE.Plane(new THREE.Vector3(-1, 0, 0), -hS),
+                    new THREE.Plane(new THREE.Vector3(0, 1, 0), -hS), new THREE.Plane(new THREE.Vector3(0, -1, 0), -hS),
+                    new THREE.Plane(new THREE.Vector3(0, 0, 1), -hT), new THREE.Plane(new THREE.Vector3(0, 0, -1), -hT)
+                );
+                boundaryGeom = new THREE.BoxGeometry(BASE_SIZE, BASE_SIZE, BASE_THICKNESS);
+
+            } else if (params.shape === 'sphere') {
+                let count = 0;
+                while(count < piecesCount) {
+                    const r = Math.pow(Math.random(), density) * hS * 0.9;
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2.0 * Math.random() - 1.0);
+                    points.push(new THREE.Vector3(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi)));
+                    count++;
+                }
+
+                const dist = hS * 0.95;
+                bounds.push(new THREE.Plane(new THREE.Vector3(1, 0, 0), -dist), new THREE.Plane(new THREE.Vector3(-1, 0, 0), -dist));
+                bounds.push(new THREE.Plane(new THREE.Vector3(0, 1, 0), -dist), new THREE.Plane(new THREE.Vector3(0, -1, 0), -dist));
+                bounds.push(new THREE.Plane(new THREE.Vector3(0, 0, 1), -dist), new THREE.Plane(new THREE.Vector3(0, 0, -1), -dist));
+                const corners = [
+                    new THREE.Vector3(1, 1, 1).normalize(), new THREE.Vector3(-1, 1, 1).normalize(),
+                    new THREE.Vector3(1, -1, 1).normalize(), new THREE.Vector3(-1, -1, 1).normalize(),
+                    new THREE.Vector3(1, 1, -1).normalize(), new THREE.Vector3(-1, 1, -1).normalize(),
+                    new THREE.Vector3(1, -1, -1).normalize(), new THREE.Vector3(-1, -1, -1).normalize()
+                ];
+                corners.forEach(n => bounds.push(new THREE.Plane(n, -dist * 0.85)));
+                boundaryGeom = new THREE.IcosahedronGeometry(hS, 1);
+
+            } else if (params.shape === 'cylinder') {
+                let count = 0;
+                while(count < piecesCount) {
+                    const r = Math.pow(Math.random(), density) * hS * 0.9;
+                    const theta = Math.random() * Math.PI * 2;
+                    points.push(new THREE.Vector3(r * Math.cos(theta), getBiasedRandom(density) * hS * 0.95, r * Math.sin(theta)));
+                    count++;
+                }
+
+                bounds.push(new THREE.Plane(new THREE.Vector3(0, 1, 0), -hS), new THREE.Plane(new THREE.Vector3(0, -1, 0), -hS));
+                for (let i = 0; i < 12; i++) {
+                    const theta = (i / 12) * Math.PI * 2;
+                    bounds.push(new THREE.Plane(new THREE.Vector3(Math.cos(theta), 0, Math.sin(theta)), -hS));
+                }
+                boundaryGeom = new THREE.CylinderGeometry(hS, hS, BASE_SIZE, 16);
+            }
+            return { points, bounds, boundaryGeom };
+        }
+
+        function getPlaneIntersection(p1, p2, p3) {
+            const n1 = p1.normal, d1 = p1.constant, n2 = p2.normal, d2 = p2.constant, n3 = p3.normal, d3 = p3.constant;
+            const n2xn3 = new THREE.Vector3().crossVectors(n2, n3);
+            const denom = n1.dot(n2xn3);
+            if (Math.abs(denom) < 1e-6) return null;
+            const v1 = n2xn3.multiplyScalar(-d1);
+            const v2 = new THREE.Vector3().crossVectors(n3, n1).multiplyScalar(-d2);
+            const v3 = new THREE.Vector3().crossVectors(n1, n2).multiplyScalar(-d3);
+            return v1.add(v2).add(v3).divideScalar(denom);
+        }
+
+        function generateVoronoiCells(points, bounds) {
+            const cells = [];
+            const EPSILON = 1e-4;
+            for (let i = 0; i < points.length; i++) {
+                const p_i = points[i];
+                const planes = [...bounds];
+                for (let j = 0; j < points.length; j++) {
+                    if (i === j) continue;
+                    const normal = new THREE.Vector3().subVectors(points[j], p_i).normalize();
+                    const midPoint = new THREE.Vector3().addVectors(p_i, points[j]).multiplyScalar(0.5);
+                    planes.push(new THREE.Plane(normal, -normal.dot(midPoint)));
+                }
+
+                const vertices = [];
+                const nPlanes = planes.length;
+                for (let a = 0; a < nPlanes - 2; a++) {
+                    for (let b = a + 1; b < nPlanes - 1; b++) {
+                        for (let c = b + 1; c < nPlanes; c++) {
+                            const pt = getPlaneIntersection(planes[a], planes[b], planes[c]);
+                            if (pt) {
+                                let isInside = true;
+                                for (let p = 0; p < nPlanes; p++) {
+                                    if (planes[p].distanceToPoint(pt) > EPSILON) { isInside = false; break; }
+                                }
+                                if (isInside) {
+                                    let duplicate = false;
+                                    for(let v of vertices) { if (v.distanceToSquared(pt) < 1e-6) { duplicate = true; break; } }
+                                    if (!duplicate) vertices.push(pt);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (vertices.length >= 4) {
+                    try {
+                        const geometry = new ConvexGeometry(vertices);
+
+                        geometry.scale(params.scaleX, params.scaleY, params.scaleZ);
+                        geometry.computeBoundingBox();
+
+                        const centroid = new THREE.Vector3();
+                        geometry.boundingBox.getCenter(centroid);
+                        geometry.translate(-centroid.x, -centroid.y, -centroid.z);
+                        geometry.userData = { centroid: centroid };
+
+                        cells.push(geometry);
+                    } catch (e) { }
+                }
+            }
+            return cells;
+        }
+
+        function clearGroup(group) {
+            const meshes = [];
+            group.traverse(child => { if (child.isMesh || child.isLineSegments || child.isPoints) meshes.push(child); });
+            meshes.forEach(m => {
+                if(m.geometry) m.geometry.dispose();
+                if(m.material) { Array.isArray(m.material) ? m.material.forEach(mat => mat.dispose()) : m.material.dispose(); }
+            });
+            while(group.children.length > 0) group.remove(group.children[0]);
+        }
+
+        function triggerRegenerate() {
+            resetPhysics();
+            document.getElementById('loading').style.display = 'flex';
+            setTimeout(() => {
+                clearGroup(boundaryGroup);
+                clearGroup(pointsMesh);
+                clearGroup(cellGroup);
+
+                generateDataAndMeshes();
+
+                document.getElementById('loading').style.display = 'none';
+                updateVisibility();
+            }, 50);
+        }
+
+        function generateDataAndMeshes() {
+            const { points, bounds, boundaryGeom } = getShapeData();
+
+            boundaryGeom.scale(params.scaleX, params.scaleY, params.scaleZ);
+            const boxEdges = new THREE.EdgesGeometry(boundaryGeom);
+            boundaryGroup.add(new THREE.LineSegments(boxEdges, new THREE.LineBasicMaterial({ color: 0x666666 })));
+
+            points.forEach(p => { p.x *= params.scaleX; p.y *= params.scaleY; p.z *= params.scaleZ; });
+            const pointsGeom = new THREE.BufferGeometry().setFromPoints(points);
+            pointsMesh.add(new THREE.Points(pointsGeom, new THREE.PointsMaterial({ color: 0xffffff, size: 0.15 })));
+
+            const originalPoints = points.map(p => new THREE.Vector3(p.x/params.scaleX, p.y/params.scaleY, p.z/params.scaleZ));
+            const cellGeometries = generateVoronoiCells(originalPoints, bounds);
+
+            cellGeometries.forEach((geom) => {
+                const group = new THREE.Group();
+
+                group.position.copy(geom.userData.centroid);
+                group.userData.centroid = geom.userData.centroid.clone();
+
+                let rough = 0.55; let metal = 0.05;
+                if (params.shape === 'plane') { rough = 0.15; metal = 0.2; }
+                if (params.shape === 'sphere') { rough = 0.35; metal = 0.1; }
+                if (params.shape === 'cylinder') { rough = 0.4; metal = 0.1; }
+
+                const gray = 0.5 + Math.random() * 0.4;
+                const solidMat = new THREE.MeshStandardMaterial({
+                    color: new THREE.Color().setHSL(0, 0, gray),
+                    roughness: rough, metalness: metal,
+                    polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
+                });
+
+                const solidMesh = new THREE.Mesh(geom, solidMat);
+                solidMesh.name = "solid";
+                solidMesh.castShadow = true;
+                solidMesh.receiveShadow = true;
+                group.add(solidMesh);
+
+                const edgesGeom = new THREE.EdgesGeometry(geom, 15);
+                const wireframeMesh = new THREE.LineSegments(edgesGeom, new THREE.LineBasicMaterial({ color: 0x111111, linewidth: 1 }));
+                wireframeMesh.name = "wireframe";
+                group.add(wireframeMesh);
+
+                cellGroup.add(group);
+            });
+        }
+
+        function updateVisibility() {
+            const step = Number(params.viewStep);
+            boundaryGroup.visible = (step === 1 || step === 2);
+            pointsMesh.visible = (step === 2);
+            cellGroup.visible = (step === 3);
+
+            cellGroup.children.forEach(cell => {
+                const solid = cell.getObjectByName("solid");
+                const wireframe = cell.getObjectByName("wireframe");
+                if (params.renderMode === 'Solid') {
+                    if (solid) solid.visible = true;
+                    if (wireframe) wireframe.visible = true;
+                } else {
+                    if (solid) solid.visible = false;
+                    if (wireframe) wireframe.visible = true;
+                }
+            });
+        }
+
+        function exportGLB() {
+            if (Number(params.viewStep) !== 3) { alert("請切換至「碎片(3)」再進行匯出！"); return; }
+
+            renderer.render(scene, camera);
+            const exporter = new GLTFExporter();
+
+            let exportTarget = cellGroup;
+
+            if (params.exportCleanMeshes) {
+                exportTarget = new THREE.Group();
+                exportTarget.name = `Shattered_${params.shape}_Root`;
+
+                cellGroup.children.forEach((cell, index) => {
+                    const solid = cell.getObjectByName("solid");
+                    if (solid && solid.visible) {
+                        const cleanMesh = solid.clone();
+                        cleanMesh.name = `Piece_${index + 1}`;
+                        cleanMesh.position.copy(cell.position);
+                        cleanMesh.quaternion.copy(cell.quaternion);
+                        cleanMesh.scale.copy(cell.scale);
+                        exportTarget.add(cleanMesh);
+                    }
+                });
+            }
+
+            exporter.parse(
+                exportTarget,
+                function ( gltf ) {
+                    const blob = new Blob( [ gltf ], { type: 'application/octet-stream' } );
+                    const url = URL.createObjectURL( blob );
+                    const link = document.createElement( 'a' );
+                    link.style.display = 'none'; link.href = url;
+
+                    const explodePercent = Math.round(params.explode * 100);
+                    const suffix = params.exportCleanMeshes ? "_clean" : "";
+                    link.download = `Shattered_${params.shape}_${params.pieces}pcs_${explodePercent}pct${suffix}.glb`;
+
+                    document.body.appendChild( link ); link.click(); document.body.removeChild( link );
+                    URL.revokeObjectURL( url );
+                },
+                function ( error ) { console.error(error); alert('匯出失敗'); },
+                { binary: true }
+            );
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            const delta = Math.min(clock.getDelta(), 0.1);
+
+            if (params.physicsPlay && physicsWorld) {
+                physicsWorld.step(1/60, delta, 3);
+
+                cellGroup.children.forEach(cell => {
+                    const body = cell.userData.physicsBody;
+                    if (body) {
+                        cell.position.copy(body.position);
+                        cell.quaternion.copy(body.quaternion);
+                    }
+                });
+            }
+            else if (Number(params.viewStep) === 3) {
+                let anyActive = false;
+                cellGroup.children.forEach(c => { if(c.userData.physicsBody) anyActive = true; });
+
+                if(!anyActive) {
+                    const maxExplodeDistance = 3.0;
+                    cellGroup.children.forEach(cell => {
+                        cell.position.copy(cell.userData.centroid).multiplyScalar(1 + params.explode * maxExplodeDistance);
+                        cell.quaternion.identity();
+                    });
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
